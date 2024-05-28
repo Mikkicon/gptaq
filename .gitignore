@@ -6,4 +6,4 @@ opt175b
 *.pt
 *egg-info*
 data
-models
+models/facebook/opt*
