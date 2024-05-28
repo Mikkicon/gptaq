@@ -1,9 +1,12 @@
 import time
+import os
+from typing import Dict 
+from transformers import AutoTokenizer
 
 import torch
 import torch.nn as nn
 
-from gptq import *
+from gptaq import *
 from modelutils import *
 from quant import *
 
@@ -12,11 +15,14 @@ def get_opt(model):
     import torch
     def skip(*args, **kwargs):
         pass
+    from transformers import OPTForCausalLM
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import OPTForCausalLM
-    model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto')
+    local_model = os.path.join("models", model)
+    model = local_model if os.path.exists(local_model) else model
+    model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto', local_files_only=local_model)
     model.seqlen = model.config.max_position_embeddings
     return model
 
@@ -66,55 +72,75 @@ def opt_sequential(model, dataloader, dev):
         model.model.decoder.project_out = model.model.decoder.project_out.cpu()
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
 
     print('Ready.')
-
-    quantizers = {}
+    # losses = []
+    quantizers = {}    
     for i in range(len(layers)):
         layer = layers[i].to(dev)
 
         subset = find_layers(layer)
-        gptq = {}
+        # print("layer", str(layer), "subset",subset.keys())
+        
+        gptaq: Dict[str, GPTAQ] = {}
         for name in subset:
-            gptq[name] = GPTQ(subset[name])
-            gptq[name].quantizer = Quantizer()
-            gptq[name].quantizer.configure(
-                args.wbits, perchannel=True, sym=args.sym, mse=False, trits=args.trits
+            gptaq[name] = GPTAQ(subset[name], {"eig": args.eigenvalues})
+            gptaq[name].quantizer = Quantizer()
+            gptaq[name].quantizer.configure(
+                args.wbits, perchannel=True, sym=args.sym, mse=True, trits=args.trits
             )
+            gptaq[name].activation_quantizer = ActivationQuantizer()
+            gptaq[name].activation_quantizer.configure(
+                args.abits, perchannel=True, sym=args.sym, mse=True, trits=args.trits
+            )
+
 
         def add_batch(name):
             def tmp(_, inp, out):
-                gptq[name].add_batch(inp[0].data, out.data)
+                gptaq[name].add_batch(inp[0].data, out.data)
             return tmp
         handles = []
         for name in subset:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
+            # TODO CLE + BC 
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         for h in handles:
             h.remove()
-
+        if i == 0:
+            print(f"quantizing weights {'and activations' if args.abits else ''}")
         for name in subset:
-            print(i, name)
-            print('Quantizing ...')
-            gptq[name].fasterquant(
+            print(f"[{i+1} / {len(layers)}] | ", end=" ")
+            # Q weights
+            gptaq[name].fasterquant(
                 percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
             )
-            quantizers['model.decoder.layers.%d.%s' % (i, name)] = gptq[name].quantizer
-            gptq[name].free()
+            print(name) # after error %
+            quantizers['model.decoder.layers.%d.%s' % (i, name)] = gptaq[name].quantizer
+            if args.abits < 16:
+                quantizers['model.decoder.layers.%d.%s.act' % (i, name)] = gptaq[name].activation_quantizer
+            # losses.append(gptaq[name].losses)
+            gptaq[name].free()
+        # run layer forward() (thru Q weights)
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
 
         layers[i] = layer.cpu()
         del layer
-        del gptq 
-        torch.cuda.empty_cache()
+        del gptaq 
+        # torch.cuda.empty_cache()
 
         inps, outs = outs, inps
+    # print(losses)
+    # print(torch.tensor(losses).mean())
+    # for i in range(len(layers)):
+    #     layer = layers[i].to(dev)
+    #     subset = find_layers(layer)
+    #     GPTAQ.cross_layer_equalization(layers=subset)
 
     model.config.use_cache = use_cache
     
@@ -176,7 +202,7 @@ def opt_eval(model, testenc, dev):
     attention_mask = cache['attention_mask']
 
     for i in range(len(layers)):
-        print(i)
+        print(f"[{i} / {len(layers)}]")
         layer = layers[i].to(dev)
 
         if args.nearest:
@@ -186,8 +212,13 @@ def opt_eval(model, testenc, dev):
                 quantizer.configure(
                     args.wbits, perchannel=True, sym=args.sym, mse=False
                 )
+                # activation_quantizer = ActivationQuantizer()
+                # activation_quantizer.configure(
+                #     args.abits, perchannel=True, sym=args.sym, mse=False
+                # )
                 W = subset[name].weight.data
                 quantizer.find_params(W, weight=True)
+                # activation_quantizer.find_params(W, weight=True)
                 subset[name].weight.data = quantize(
                     W, quantizer.scale, quantizer.zero, quantizer.maxq
                 ).to(next(iter(layer.parameters())).dtype)
@@ -223,7 +254,7 @@ def opt_eval(model, testenc, dev):
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print(ppl.item())
+    print(int(ppl.item()), "PPL")
 
     model.config.use_cache = use_cache
 
@@ -307,7 +338,7 @@ def opt_multigpu(model, gpus):
 
 def benchmark(model, input_ids, check=False):
     input_ids = input_ids.to(model.gpus[0] if hasattr(model, 'gpus') else DEV)
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
 
     cache = {'past': None}
     def clear_past(i):
@@ -324,12 +355,12 @@ def benchmark(model, input_ids, check=False):
         loss = nn.CrossEntropyLoss()
         tot = 0.
 
-    def sync():
-        if hasattr(model, 'gpus'):
-            for gpu in model.gpus:
-                torch.cuda.synchronize(gpu)
-        else:
-            torch.cuda.synchronize()
+    # def sync():
+    #     if hasattr(model, 'gpus'):
+    #         for gpu in model.gpus:
+    #             torch.cuda.synchronize(gpu)
+    #     else:
+    #         torch.cuda.synchronize()
     with torch.no_grad():
         attention_mask = torch.ones((1, input_ids.numel()), device=DEV)
         times = []
@@ -340,19 +371,29 @@ def benchmark(model, input_ids, check=False):
                 past_key_values=cache['past'],
                 attention_mask=attention_mask[:, :(i + 1)].reshape((1, -1))
             )
-            sync()
+            # sync()
             times.append(time.time() - tick)
             print(i, times[-1])
             if check and i != input_ids.numel() - 1:
                 tot += loss(out.logits[0].to(DEV), input_ids[:, (i + 1)].to(DEV)).float()
             cache['past'] = list(out.past_key_values)
             del out
-        sync()
+        # sync()
         import numpy as np
         print('Median:', np.median(times))
         if check:
             print('PPL:', torch.exp(tot / (input_ids.numel() - 1)).item())
 
+
+def new_func(model, tokenizer, input_ids):
+    logits = model(input_ids).logits
+    probabilities = torch.softmax(logits, dim=-1)
+    top_probs, top_indices = torch.topk(probabilities, 3, dim=-1)
+    decoded_tokens = [tokenizer.decode(indices) for indices in top_indices[0][-1]]
+    top_probs = top_probs[0][-1].tolist()
+
+    for token, prob in zip(decoded_tokens, top_probs):
+        print(f"Token: {token}, Probability: {prob:.4f}")
 
 if __name__ == '__main__':
     import argparse
@@ -387,6 +428,18 @@ if __name__ == '__main__':
     parser.add_argument(
         '--wbits', type=int, default=16, choices=[2, 3, 4, 16],
         help='#bits to use for quantization; use 16 for evaluating base model.'
+    )
+    parser.add_argument(
+        '--abits', type=int, default=16, choices=[2, 3, 4, 16],
+        help='#bits to use for quantization; use 16 for evaluating base model.'
+    )
+    parser.add_argument(
+        '--eigenvalues', type=int, default=0, choices=[0, 1],
+        help='enable/disable eigenvalues in quantization.'
+    )
+    parser.add_argument(
+        '--cle', type=int, default=0, choices=[0, 1],
+        help='enable/disable cross-layer equalization.'
     )
     parser.add_argument(
         '--trits', action='store_true',
@@ -445,10 +498,17 @@ if __name__ == '__main__':
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
 
+    # tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # input_ids = tokenizer.encode("The quick brown fox jumps over the lazy dog", return_tensors='pt')
+
+    # new_func(args.model, tokenizer, input_ids)
+
     if args.wbits < 16 and not args.nearest:
         tick = time.time()
         quantizers = opt_sequential(model, dataloader, DEV)
-        print(time.time() - tick)
+        print(int(time.time() - tick), "s")
+
+    # new_func(args.model, tokenizer, input_ids)
 
     if args.benchmark:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
@@ -462,9 +522,11 @@ if __name__ == '__main__':
     if args.load:
         exit()
 
-    datasets = ['wikitext2', 'ptb', 'c4'] 
+    # datasets = ['wikitext2', 'ptb', 'c4'] 
+    datasets = ['ptb'] 
     if args.new_eval:
       datasets = ['wikitext2', 'ptb-new', 'c4-new']
+    # exit()
     for dataset in datasets: 
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen

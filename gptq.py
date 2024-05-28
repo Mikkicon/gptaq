@@ -69,22 +69,11 @@ class GPTQ:
 
         tick = time.time()
 
-        if not self.quantizer.ready():
-            self.quantizer.find_params(W, weight=True)
-
         H = self.H
         del self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
-
-        if static_groups:
-            import copy
-            groups = []
-            for i in range(0, self.columns, groupsize):
-                quantizer = copy.deepcopy(self.quantizer)
-                quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
-                groups.append(quantizer)
 
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
@@ -98,10 +87,32 @@ class GPTQ:
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
+        # print(H[:5, :5])
+
+        if static_groups:
+            import copy
+            groups = []
+            for i in range(0, self.columns, groupsize):
+                quantizer = copy.deepcopy(self.quantizer)
+                quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
+                groups.append(quantizer)
+
+        elif not self.quantizer.ready():
+            if self.eig:
+                # eigenvalues, _ = torch.linalg.eigh(H)
+                eigenvalues_complex, _ = torch.linalg.eig(H)
+                if eigenvalues_complex.imag.sum() > 0:
+                    raise Exception("Complex Eigenvalues")
+                self.quantizer.find_params(W, weight=True, eigenvalues=eigenvalues_complex.real)
+            else:
+                self.quantizer.find_params(W, weight=True)
+
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
+        # print(Hinv[:5, :5])
+        # print(W[:5, :5])
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -126,6 +137,8 @@ class GPTQ:
                         if actorder:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
+                # TODO - can I use different Q grids? dynamic scale from hessian or if it's in min-max range - OK?
+                # try without Hessian on my model and then add Hessian and compare 
 
                 q = quantize(
                     w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
@@ -148,9 +161,10 @@ class GPTQ:
                 print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
                 print(torch.sum(Losses))
 
-        torch.cuda.synchronize()
-        print('time %.2f' % (time.time() - tick))
-        print('error', torch.sum(Losses).item())
+        # torch.cuda.synchronize()
+        print('time %.2f' % (time.time() - tick), end=" | ")
+        print('error', torch.sum(Losses).item(), end=" | ")
+        # self.losses.append(torch.sum(Losses))
 
         if actorder:
             Q = Q[:, invperm]

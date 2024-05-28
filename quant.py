@@ -33,7 +33,7 @@ class Quantizer(nn.Module):
         if trits:
             self.maxq = torch.tensor(-1) 
 
-    def find_params(self, x, weight=False):
+    def find_params(self, x:torch.Tensor, weight=False, eigenvalues:torch.Tensor=None):
         dev = x.device
         self.maxq = self.maxq.to(dev)
 
@@ -74,6 +74,8 @@ class Quantizer(nn.Module):
               self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
           else:
               self.zero = torch.round(-xmin / self.scale)
+        if eigenvalues is not None:
+            eigenvalues = (eigenvalues - eigenvalues.min()) / (eigenvalues.max() - eigenvalues.min())
 
         if self.mse:
             best = torch.full([x.shape[0]], float('inf'), device=dev)
@@ -85,14 +87,26 @@ class Quantizer(nn.Module):
                 zero1 = torch.round(-xmin1 / scale1) if not self.sym else self.zero
                 q = quantize(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq)
                 q -= x
+                # print(q[:5])
                 q.abs_()
+                # print(q[:5])
                 q.pow_(self.norm)
+                # print(q[:5])
                 err = torch.sum(q, 1)
+                if eigenvalues is not None:
+                    eigenvalues = eigenvalues.to(dev)
+                    weighted_q = q * eigenvalues
+                    err = torch.sum(weighted_q, 1)
                 tmp = err < best
                 if torch.any(tmp):
                     best[tmp] = err[tmp]
                     self.scale[tmp] = scale1[tmp]
                     self.zero[tmp] = zero1[tmp]
+        elif eigenvalues is not None:
+            eigenvalues = eigenvalues.to(dev)
+            self.scale = self.scale * eigenvalues
+            self.zero = self.zero * eigenvalues
+
         if not self.perchannel:
             if weight:
                 tmp = shape[0]
