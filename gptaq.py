@@ -31,7 +31,6 @@ class GPTAQ(GPTQ):
   def add_batch(self, inp, out):
     if self.activation_quantizer.act_q_enabled:
       inp = self.activation_quantizer.quantize(inp)
-      print("A Q input", end=" | ")
     return super().add_batch(inp, out)
 
   @staticmethod

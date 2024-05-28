@@ -114,7 +114,7 @@ def opt_sequential(model, dataloader, dev):
         for h in handles:
             h.remove()
         if i == 0:
-            print(f"quantizing weights {'and activations' if args.abits else ''}")
+            print(f"quantizing weights {'and activations' if args.abits < 16 else ''}")
         for name in subset:
             print(f"[{i+1} / {len(layers)}] | ", end=" ")
             # Q weights
