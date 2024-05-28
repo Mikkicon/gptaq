@@ -72,7 +72,9 @@ def opt_sequential(model, dataloader, dev):
         model.model.decoder.project_out = model.model.decoder.project_out.cpu()
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    # torch.cuda.empty_cache()
+    
+    if torch.cuda.is_available(): 
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -132,7 +134,8 @@ def opt_sequential(model, dataloader, dev):
         layers[i] = layer.cpu()
         del layer
         del gptaq 
-        # torch.cuda.empty_cache()
+        if torch.cuda.is_available(): 
+            torch.cuda.empty_cache()
 
         inps, outs = outs, inps
     # print(losses)
@@ -338,7 +341,8 @@ def opt_multigpu(model, gpus):
 
 def benchmark(model, input_ids, check=False):
     input_ids = input_ids.to(model.gpus[0] if hasattr(model, 'gpus') else DEV)
-    # torch.cuda.synchronize()
+    if torch.cuda.is_available(): 
+        torch.cuda.synchronize()
 
     cache = {'past': None}
     def clear_past(i):
@@ -355,12 +359,12 @@ def benchmark(model, input_ids, check=False):
         loss = nn.CrossEntropyLoss()
         tot = 0.
 
-    # def sync():
-    #     if hasattr(model, 'gpus'):
-    #         for gpu in model.gpus:
-    #             torch.cuda.synchronize(gpu)
-    #     else:
-    #         torch.cuda.synchronize()
+    def sync():
+        if hasattr(model, 'gpus'):
+            for gpu in model.gpus:
+                torch.cuda.synchronize(gpu)
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
     with torch.no_grad():
         attention_mask = torch.ones((1, input_ids.numel()), device=DEV)
         times = []
@@ -371,14 +375,14 @@ def benchmark(model, input_ids, check=False):
                 past_key_values=cache['past'],
                 attention_mask=attention_mask[:, :(i + 1)].reshape((1, -1))
             )
-            # sync()
+            sync()
             times.append(time.time() - tick)
             print(i, times[-1])
             if check and i != input_ids.numel() - 1:
                 tot += loss(out.logits[0].to(DEV), input_ids[:, (i + 1)].to(DEV)).float()
             cache['past'] = list(out.past_key_values)
             del out
-        # sync()
+        sync()
         import numpy as np
         print('Median:', np.median(times))
         if check:
