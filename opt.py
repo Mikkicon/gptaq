@@ -22,7 +22,7 @@ def get_opt(model):
     from transformers import OPTForCausalLM
     local_model = os.path.join("models", model)
     model = local_model if os.path.exists(local_model) else model
-    model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto', local_files_only=local_model)
+    model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto', local_files_only=os.path.exists(local_model))
     model.seqlen = model.config.max_position_embeddings
     return model
 
