@@ -99,11 +99,14 @@ class GPTQ:
 
         elif not self.quantizer.ready():
             if self.eig:
-                # eigenvalues, _ = torch.linalg.eigh(H)
-                eigenvalues_complex, _ = torch.linalg.eig(H)
-                if eigenvalues_complex.imag.sum() > 0:
-                    raise Exception("Complex Eigenvalues")
-                self.quantizer.find_params(W, weight=True, eigenvalues=eigenvalues_complex.real)
+                if self.dev == torch.device("cpu"):
+                    eigenvalues_complex, _ = torch.linalg.eig(H)
+                    if eigenvalues_complex.imag.sum() > 0:
+                        raise Exception("Complex Eigenvalues")
+                    eigenvalues = eigenvalues_complex.real
+                else:
+                    eigenvalues, _ = torch.linalg.eigh(H)
+                self.quantizer.find_params(W, weight=True, eigenvalues=eigenvalues)
             else:
                 self.quantizer.find_params(W, weight=True)
 

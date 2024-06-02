@@ -1,3 +1,4 @@
+from typing import Dict
 import torch
 import torch.nn as nn
 
@@ -6,7 +7,7 @@ import torch.nn as nn
 DEV = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
+def find_layers(module, layers=[nn.Conv2d, nn.Linear], name='') -> Dict[str, nn.Module]:
     if type(module) in layers:
         return {name: module}
     res = {}
