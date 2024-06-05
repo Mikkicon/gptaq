@@ -6,4 +6,5 @@ opt175b
 *.pt
 *egg-info*
 data
-models/facebook/opt*
+models/facebook
+.vscode

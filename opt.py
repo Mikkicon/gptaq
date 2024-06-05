@@ -1,7 +1,7 @@
 import time
 import os
 from typing import Dict 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, OPTForCausalLM
 
 import torch
 import torch.nn as nn
@@ -15,7 +15,6 @@ def get_opt(model):
     import torch
     def skip(*args, **kwargs):
         pass
-    from transformers import OPTForCausalLM
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
@@ -26,8 +25,18 @@ def get_opt(model):
     model.seqlen = model.config.max_position_embeddings
     return model
 
+def get_act_quant(amethod):
+    if amethod == "rtn":
+        print("USING RTN ACTIVATION Q")
+        return RTNActQuantizer()
+    if amethod == "token":
+        print("USING TOKEN-WISE ACTIVATION Q")
+        return TokenWiseActQuantizer()
+    print("USING OBS ACTIVATION Q")
+    return Quantizer() # OBS
+
 @torch.no_grad()
-def opt_sequential(model, dataloader, dev):
+def opt_sequential(model: OPTForCausalLM, dataloader, dev):
     print('Starting ...')
 
     use_cache = model.config.use_cache
@@ -78,58 +87,88 @@ def opt_sequential(model, dataloader, dev):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
+    aquant = args.amethod and args.abits < 16
 
     print('Ready.')
-    # losses = []
+    print("iterating decoder layers...")
+
+    quantizer_class = get_act_quant(args.amethod)
     quantizers = {}    
     for i in range(len(layers)):
         layer = layers[i].to(dev)
-
         subset = find_layers(layer)
-        # print("layer", str(layer), "subset",subset.keys())
-        
+
+        # ========== CONFIGURATION ==========
         gptaq: Dict[str, GPTAQ] = {}
         for name in subset:
-            gptaq[name] = GPTAQ(subset[name], {"eig": args.eigenvalues})
-            gptaq[name].quantizer = Quantizer()
-            gptaq[name].quantizer.configure(
-                args.wbits, perchannel=True, sym=args.sym, mse=True, trits=args.trits
+            gptaq_ = GPTAQ(subset[name], {"eig": args.eigenvalues, "reoptimize": args.amethod == "reoptimize"})
+            gptaq_.quantizer = Quantizer()
+            gptaq_.activation_quantizer = quantizer_class
+            gptaq_.configure(
+                wbits=args.wbits, abits=args.abits, perchannel=True, sym=args.sym, mse=True, trits=args.trits
             )
-            gptaq[name].activation_quantizer = ActivationQuantizer()
-            gptaq[name].activation_quantizer.configure(
-                args.abits, perchannel=True, sym=args.sym, mse=True, trits=args.trits
-            )
+            gptaq[name] = gptaq_
 
+        # ========== CLE + BC ==========
+        bias_corrections = {}
+        if args.cle == 1:
+            subset_k = list(subset.keys())
+            layer_pairs = list(zip(subset_k[:-1], subset_k[1:]))
+            for (layer1_name, layer2_name) in layer_pairs:
+                layer1 = subset[layer1_name]
+                layer2 = subset[layer2_name]
+                out_true = layer2(layer1(inps[0].unsqueeze(0)))
+                GPTAQ.CLE_l1_l2(layer1=layer1,layer2=layer2)
+                out_quant = layer2(layer1(inps[0].unsqueeze(0)))
+                out_quant = out_quant.view(inps.size(0), inps.size(1), -1)
+                out_diff = out_true - out_quant
+                bias_corrections[layer2_name] = torch.mean(out_diff, dim=0)
 
-        def add_batch(name):
+                if DEBUG:
+                    out_Q = layer2(layer1(inps[0].unsqueeze(0)))
+                    print("CLE err", GPTAQ.MSE(out_true, out_Q))
+            
+        def after_forward(name):
             def tmp(_, inp, out):
-                gptaq[name].add_batch(inp[0].data, out.data)
+                if DEBUG:
+                    print(name)
+                gptaq[name].after_forward(inp[0].data, out.data)
             return tmp
         handles = []
         for name in subset:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
+            handles.append(subset[name].register_forward_hook(after_forward(name)))
         for j in range(args.nsamples):
-            # TODO CLE + BC 
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        for h in handles:
-            h.remove()
+        # remove_handles(handles)
         if i == 0:
-            print(f"quantizing weights {'and activations' if args.abits < 16 else ''}")
+            print(f"quantizing weights")
+
+        # ========== W QUANTIZATION ==========
         for name in subset:
             print(f"[{i+1} / {len(layers)}] | ", end=" ")
-            # Q weights
             gptaq[name].fasterquant(
                 percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
             )
             print(name) # after error %
             quantizers['model.decoder.layers.%d.%s' % (i, name)] = gptaq[name].quantizer
-            if args.abits < 16:
-                quantizers['model.decoder.layers.%d.%s.act' % (i, name)] = gptaq[name].activation_quantizer
-            # losses.append(gptaq[name].losses)
-            gptaq[name].free()
-        # run layer forward() (thru Q weights)
+            # gptaq[name].free()
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+
+        # ========== A QUANTIZATION ==========
+        print('quantizing activations ...')
+        
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+        
+        # if args.cle == 1:
+        #     for name in subset:
+        #         if name in bias_corrections:
+        #             corrected_bias = subset[name].bias.data + bias_corrections[name]
+        #             subset[name].bias.data.copy_(corrected_bias)
+        
+        free_gptaqs(gptaqs=gptaq)
+        remove_handles(handles)
 
         layers[i] = layer.cpu()
         del layer
@@ -138,16 +177,23 @@ def opt_sequential(model, dataloader, dev):
             torch.cuda.empty_cache()
 
         inps, outs = outs, inps
-    # print(losses)
-    # print(torch.tensor(losses).mean())
-    # for i in range(len(layers)):
-    #     layer = layers[i].to(dev)
-    #     subset = find_layers(layer)
-    #     GPTAQ.cross_layer_equalization(layers=subset)
-
+        break
     model.config.use_cache = use_cache
-    
+
     return quantizers
+
+def remove_handles(handles):
+    for h in handles:
+        h.remove()
+
+def free_gptaqs(gptaqs: dict):
+    for gptaq in gptaqs.values():
+        gptaq.free()
+
+def init_actquant(layerp):
+    def tmp(layer, inp, out):
+        layerp.quantizer.find_params(inp[0].data)
+    return tmp
 
 @torch.no_grad()
 def opt_eval(model, testenc, dev):
@@ -276,6 +322,7 @@ def opt_pack3(model, quantizers):
     return model
 
 def load_quant3(model, checkpoint):
+    import transformers
     from transformers import OPTConfig, OPTForCausalLM 
     config = OPTConfig.from_pretrained(model)
     def noop(*args, **kwargs):
@@ -313,6 +360,7 @@ def opt_multigpu(model, gpus):
     if hasattr(model.model.decoder, 'final_layer_norm') and model.model.decoder.final_layer_norm:
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(gpus[-1])
     import copy
+    import math
     model.lm_head = copy.deepcopy(model.lm_head).to(gpus[-1])
 
     cache = {'mask': None}
@@ -438,6 +486,10 @@ if __name__ == '__main__':
         help='#bits to use for quantization; use 16 for evaluating base model.'
     )
     parser.add_argument(
+        '--amethod', choices=["rtn", "reoptimize", "token"],
+        help='activation quantization method'
+    )
+    parser.add_argument(
         '--eigenvalues', type=int, default=0, choices=[0, 1],
         help='enable/disable eigenvalues in quantization.'
     )
@@ -511,7 +563,7 @@ if __name__ == '__main__':
         tick = time.time()
         quantizers = opt_sequential(model, dataloader, DEV)
         print(int(time.time() - tick), "s")
-
+    exit()
     # new_func(args.model, tokenizer, input_ids)
 
     if args.benchmark:

@@ -15,7 +15,8 @@ torch.backends.cudnn.allow_tf32 = False
 
 
 class GPTQ:
-
+    layer: torch.nn.Module
+    
     def __init__(self, layer):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -98,6 +99,7 @@ class GPTQ:
                 groups.append(quantizer)
 
         elif not self.quantizer.ready():
+            # ========== EIGENVALUES ==========
             if self.eig:
                 if self.dev == torch.device("cpu"):
                     eigenvalues_complex, _ = torch.linalg.eig(H)
@@ -140,9 +142,6 @@ class GPTQ:
                         if actorder:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
-                # TODO - can I use different Q grids? dynamic scale from hessian or if it's in min-max range - OK?
-                # try without Hessian on my model and then add Hessian and compare 
-
                 q = quantize(
                     w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 ).flatten()
