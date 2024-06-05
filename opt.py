@@ -120,13 +120,13 @@ def opt_sequential(model: OPTForCausalLM, dataloader, dev):
                 out_true = layer2(layer1(inps[0].unsqueeze(0)))
                 GPTAQ.CLE_l1_l2(layer1=layer1,layer2=layer2)
                 out_quant = layer2(layer1(inps[0].unsqueeze(0)))
-                out_quant = out_quant.view(inps.size(0), inps.size(1), -1)
-                out_diff = out_true - out_quant
-                bias_corrections[layer2_name] = torch.mean(out_diff, dim=0)
+                # out_quant = out_quant.view(inps.size(0), inps.size(1), -1)
+                # out_diff = out_true - out_quant
+                # bias_corrections[layer2_name] = torch.mean(out_diff, dim=0)
 
                 if DEBUG:
                     out_Q = layer2(layer1(inps[0].unsqueeze(0)))
-                    print("CLE err", GPTAQ.MSE(out_true, out_Q))
+                    print("CLE err", GPTAQ.MSE(out_true, out_quant))
             
         def after_forward(name):
             def tmp(_, inp, out):
