@@ -5,7 +5,7 @@ import torch
 from scipy.stats import norm
 
 
-DEBUG=True
+DEBUG=False
 
 class GPTAQ(GPTQ):
   quantizer: Quantizer
@@ -21,9 +21,9 @@ class GPTAQ(GPTQ):
   biases = [] # corrected biases
 
   def __init__(self, layer, options = {}):
+    super(GPTAQ, self).__init__(layer)
     self.eig = bool(options["eig"]) if "eig" in options else False
     self.reoptimize_W = bool(options["reoptimize"]) if "reoptimize" in options else False
-    super().__init__(layer)
 
   def configure(self, wbits, abits, **kvargs):
     self.act_q_enabled = abits < 16
@@ -41,7 +41,7 @@ class GPTAQ(GPTQ):
         print(str(type(self.layer)), "weights quantized")
     
       if self.reoptimize_W:
-        self.layer.weights = self.reoptimize_weights(inp, out)
+        self.layer.weight = self.reoptimize_weights(inp, out)
     
       inp = self.activation_quantizer.quantize(inp)
       weights: torch.Tensor = self.layer.weight.data
@@ -67,6 +67,8 @@ class GPTAQ(GPTQ):
 
   def reoptimize_weights(self, X: torch.Tensor, Y: torch.Tensor): 
       # Compute (X^T X)^-1 X^T Y
+      if X.shape[0] != X.shape[1]:
+         return self.layer.weight
       XTX_inv = torch.inverse(torch.matmul(X.T, X))
       XTY = torch.matmul(X.T, Y)
       W_opt = torch.matmul(XTX_inv, XTY)

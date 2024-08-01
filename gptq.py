@@ -8,7 +8,6 @@ import transformers
 from quant import *
 
 
-DEBUG = False 
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -31,9 +30,8 @@ class GPTQ:
         self.nsamples = 0
 
     def add_batch(self, inp, out):
-        if DEBUG:
-            self.inp1 = inp
-            self.out1 = out
+        self.inp1 = inp
+        self.out1 = out
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
@@ -157,11 +155,10 @@ class GPTQ:
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-            if DEBUG:
-                self.layer.weight.data[:, :i2] = Q[:, :i2]
-                self.layer.weight.data[:, i2:] = W[:, i2:]
-                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-                print(torch.sum(Losses))
+            self.layer.weight.data[:, :i2] = Q[:, :i2]
+            self.layer.weight.data[:, i2:] = W[:, i2:]
+            print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+            print(torch.sum(Losses))
 
         if torch.cuda.is_available(): 
             torch.cuda.synchronize()
@@ -175,13 +172,12 @@ class GPTQ:
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        if DEBUG:
+        if False:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
 
     def free(self):
-        if DEBUG:
-            self.inp1 = None
-            self.out1 = None
+        self.inp1 = None
+        self.out1 = None
         self.H = None
         self.Losses = None
         self.Trace = None

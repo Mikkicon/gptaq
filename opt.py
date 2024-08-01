@@ -92,7 +92,7 @@ def opt_sequential(model: OPTForCausalLM, dataloader, dev):
     print('Ready.')
     print("iterating decoder layers...")
 
-    quantizer_class = get_act_quant(args.amethod)
+    act_quantizer_class = get_act_quant(args.amethod)
     quantizers = {}    
     for i in range(len(layers)):
         layer = layers[i].to(dev)
@@ -103,7 +103,7 @@ def opt_sequential(model: OPTForCausalLM, dataloader, dev):
         for name in subset:
             gptaq_ = GPTAQ(subset[name], {"eig": args.eigenvalues, "reoptimize": args.amethod == "reoptimize"})
             gptaq_.quantizer = Quantizer()
-            gptaq_.activation_quantizer = quantizer_class
+            gptaq_.activation_quantizer = act_quantizer_class
             gptaq_.configure(
                 wbits=args.wbits, abits=args.abits, perchannel=True, sym=args.sym, mse=True, trits=args.trits
             )
@@ -177,7 +177,7 @@ def opt_sequential(model: OPTForCausalLM, dataloader, dev):
             torch.cuda.empty_cache()
 
         inps, outs = outs, inps
-        break
+        # break
     model.config.use_cache = use_cache
 
     return quantizers
@@ -432,7 +432,7 @@ def benchmark(model, input_ids, check=False):
             del out
         sync()
         import numpy as np
-        print('Median:', np.median(times))
+        print('Median speed:', np.median(times))
         if check:
             print('PPL:', torch.exp(tot / (input_ids.numel() - 1)).item())
 
@@ -563,7 +563,7 @@ if __name__ == '__main__':
         tick = time.time()
         quantizers = opt_sequential(model, dataloader, DEV)
         print(int(time.time() - tick), "s")
-    exit()
+    # exit()
     # new_func(args.model, tokenizer, input_ids)
 
     if args.benchmark:
